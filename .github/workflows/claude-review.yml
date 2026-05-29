@@ -1,0 +1,95 @@
+name: Claude Multi-Agent Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'src/**/*.py'
+      - 'src/**/*.ts'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout (full history for 3-dot diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed files
+        id: changed
+        run: |
+          BASE_REF="origin/${{ github.base_ref }}"
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          FILES=$(git diff --name-only "${BASE_REF}"...HEAD -- 'src/**/*.py' 'src/**/*.ts' || true)
+          COUNT=$(printf '%s\n' "$FILES" | grep -c . || true)
+          COUNT=${COUNT:-0}
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          {
+            echo "files<<EOF"
+            printf '%s\n' "$FILES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Changed files: $COUNT"
+
+      # ── 비용 가드 ────────────────────────────────────────────
+      - name: Skip oversized PR (>10 files) — post warning only
+        if: fromJSON(steps.changed.outputs.count) > 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "⚠️ 변경량이 너무 많습니다. 10개 이하로 분리하는 것을 권장합니다. (현재: ${{ steps.changed.outputs.count }}개)"
+      # ────────────────────────────────────────────────────────
+
+      - name: Setup Node.js
+        if: fromJSON(steps.changed.outputs.count) <= 10 && fromJSON(steps.changed.outputs.count) > 0
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code (headless)
+        if: fromJSON(steps.changed.outputs.count) <= 10 && fromJSON(steps.changed.outputs.count) > 0
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run Multi-Agent Review (headless)
+        if: fromJSON(steps.changed.outputs.count) <= 10 && fromJSON(steps.changed.outputs.count) > 0
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          mkdir -p /tmp/review
+          PROMPT=$(cat <<'EOF'
+          @CLAUDE.md 의 워크플로우를 그대로 수행해줘.
+
+          - 변경 파일 목록은 환경변수 $CHANGED_FILES 에 줄바꿈 구분으로 주어진다.
+          - security-reviewer, performance-reviewer, style-reviewer 세 서브에이전트를 병렬 호출.
+          - 각 에이전트는 결과를 /tmp/review/{security,performance,style}.md 로 저장.
+          - 오케스트레이터는 세 파일을 읽어 /tmp/review/final.md 를 작성한다 (CLAUDE.md 5절 기준 그대로).
+          - 추가 도구 사용은 최소화. 코드 수정 금지 (리뷰만).
+          EOF
+          )
+          claude -p "$PROMPT" \
+            --permission-mode acceptEdits \
+            --allowedTools "Read,Glob,Grep,Bash,Write,Task" \
+            --output-format text
+
+      - name: Post review comment
+        if: fromJSON(steps.changed.outputs.count) <= 10 && fromJSON(steps.changed.outputs.count) > 0 && always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -s /tmp/review/final.md ]; then
+            gh pr comment "${{ github.event.pull_request.number }}" \
+              --body-file /tmp/review/final.md
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" \
+              --body "⚠️ Multi-Agent 리뷰 결과 파일이 생성되지 않았습니다. Actions 로그를 확인해주세요."
+          fi
